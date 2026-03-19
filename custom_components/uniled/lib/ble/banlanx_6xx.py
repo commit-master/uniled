@@ -845,16 +845,44 @@ class SP6xxEProxy(UniledBleModel):
         """Match to one of the SP6xxE devices"""
         if not hasattr(advertisement, "manufacturer_data"):
             return None
+        local_name = getattr(advertisement, "local_name", None) or ""
+        local_name_upper = local_name.upper() if isinstance(local_name, str) else ""
+        is_sp5xx_probe = local_name_upper.startswith("SP5")
+
         for mid, data in advertisement.manufacturer_data.items():
-            if mid != self.ble_manufacturer_id or data[1] != 0x10:
+            if mid != self.ble_manufacturer_id:
                 continue
+
+            # Manufacturer payload is expected to be a short byte-array.
+            if not data:
+                continue
+
+            # Existing SP6xx devices have a 0x10 marker at data[1].
+            # SP5xx variants (incl. SP541E) have been observed to not follow this.
+            if not is_sp5xx_probe:
+                if len(data) < 2 or data[1] != 0x10:
+                    continue
+
+            id_byte = data[0]
+
             for signature in MODEL_SIGNATURE_LIST:
                 for id, name in signature.ids.items():
-                    if id != data[0]:
+                    if id != id_byte:
                         continue
                     return BanlanX6xx(
                         id=id, name=name, info=signature.info, conf=signature.conf
                     )
+
+            # Stage 1 probe fallback: instantiate something SP6xx-like so we can
+            # capture notification payloads without crashing/timeouts.
+            if is_sp5xx_probe:
+                fallback_name = local_name or f"SP5xxE_{id_byte:02X}"
+                return BanlanX6xx(
+                    id=id_byte,
+                    name=fallback_name,
+                    info="SP5xxE (probe)",
+                    conf=SP630E.conf,
+                )
         return None
 
     def __init__(self, id: int, name: str, info: str):
@@ -936,16 +964,65 @@ class BanlanX6xx(SP6xxEProxy):
         data: bytearray,
     ) -> bool:
         """Parse notification message(s)"""
-        data = self.__decoder(data)
+        device_name = getattr(device, "name", "") or ""
+        model_name = getattr(self, "model_name", "") or ""
+        is_sp5xx_probe = model_name.upper().startswith("SP5") or device_name.upper().startswith(
+            "SP5"
+        )
+
+        raw_data = data
+        raw_hex = raw_data.hex() if hasattr(raw_data, "hex") else repr(raw_data)
+
+        try:
+            data = self.__decoder(data)
+        except ParseNotificationError as ex:
+            if is_sp5xx_probe:
+                _LOGGER.debug(
+                    "%s: SP5xx probe: decoder failed: %s; raw=%s",
+                    device_name,
+                    str(ex),
+                    raw_hex,
+                )
+                return True
+            raise
 
         if data[self._MESSAGE_TYPE] != self._DEVICE_STATUS:
+            if is_sp5xx_probe:
+                _LOGGER.debug(
+                    "%s: SP5xx probe: unexpected message type: %s (expected %s); raw=%s",
+                    device_name,
+                    data[self._MESSAGE_TYPE],
+                    self._DEVICE_STATUS,
+                    raw_hex,
+                )
+                return True
             # raise ParseNotificationError("Invalid Packet!")
             _LOGGER.warning("Invalid Packet!")
             return False
 
+        # BanlanX6xx parsing expects a fairly large status packet (fixed offsets).
+        # SP5xx variants can be shorter/different, so guard to avoid IndexError.
+        if len(data) < 53:
+            if is_sp5xx_probe:
+                _LOGGER.debug(
+                    "%s: SP5xx probe: status packet too short (%d bytes); raw=%s",
+                    device_name,
+                    len(data),
+                    raw_hex,
+                )
+                return True
+            raise ParseNotificationError("Packet too short for BanlanX6xx parsing")
+
         cfg: _CONFIG = self.match_light_type_config(data[19])
         device.master.context = cfg
         if not cfg:
+            if is_sp5xx_probe:
+                _LOGGER.debug(
+                    "%s: SP5xx probe: missing light type config (light_type=%s)",
+                    device_name,
+                    data[19],
+                )
+                return True
             raise ParseNotificationError("Missing light type config!")
 
         firmware = data[11:18].decode("utf-8")
