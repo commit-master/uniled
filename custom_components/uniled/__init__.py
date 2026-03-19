@@ -16,8 +16,10 @@ from homeassistant.helpers.entity_registry import async_get, async_migrate_entri
 from homeassistant.const import (
     CONF_ADDRESS,
     CONF_COUNTRY,
+    CONF_HOST,
     CONF_MODEL,
     CONF_PASSWORD,
+    CONF_PORT,
     CONF_USERNAME,
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
@@ -76,6 +78,7 @@ PLATFORMS: list[Platform] = [
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up UNILED from a config entry."""
     transport: str = entry.data.get(CONF_TRANSPORT)
+    address: str = str(entry.data.get(CONF_ADDRESS, entry.data.get(CONF_HOST, "")))
 
     if transport == UNILED_TRANSPORT_ZNG:
         mesh_id: str = entry.data.get(CONF_MESH_ID)
@@ -223,9 +226,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     elif transport == UNILED_TRANSPORT_NET:
-        raise ConfigEntryError(
-            f"Unable to communicate with network device {address} as currently not supported!"
-        )
+        host: str = str(entry.data.get(CONF_HOST, entry.data.get(CONF_ADDRESS, "")))
+        port: int = int(entry.data.get(CONF_PORT, 8587))
+        model_name: str = entry.data.get(CONF_MODEL, None)
+        if not host:
+            raise ConfigEntryError("Network host/IP is missing from configuration")
+        uniled = UniledNetDevice(entry.options, host, port, model_name)
     else:
         raise ConfigEntryError(
             f"Unable to communicate with device {address} of unsupported class: {transport}"

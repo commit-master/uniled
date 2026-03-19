@@ -479,6 +479,7 @@ class UniledConfigFlowHandler(UniledMeshHandler, flow.ConfigFlow, domain=DOMAIN)
         self._discovery_ble_info: BluetoothServiceInfoBleak | None = None
         self._discovered_ble_devices: dict[str, BluetoothServiceInfoBleak] = {}
         self._discovered_zng_meshes: dict[str, int] = {}
+        self._manual_net_option = "__manual_net__"
 
     async def async_step_bluetooth(
         self, discovery: BluetoothServiceInfoBleak
@@ -515,6 +516,8 @@ class UniledConfigFlowHandler(UniledMeshHandler, flow.ConfigFlow, domain=DOMAIN)
 
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
+            if address == self._manual_net_option:
+                return await self.async_step_net_manual()
 
             if address in self._discovered_zng_meshes:
                 await self.async_set_unique_id(address)
@@ -568,28 +571,98 @@ class UniledConfigFlowHandler(UniledMeshHandler, flow.ConfigFlow, domain=DOMAIN)
                 self._discovered_ble_devices[discovery.address] = discovery
                 _LOGGER.info("Discovered '%s' ble device", discovery.address)
 
-        if not self._discovered_ble_devices and not self._discovered_zng_meshes:
-            return self.async_abort(reason="no_devices_found")
+        options = dict(
+            functools.reduce(
+                operator.or_,
+                [
+                    {
+                        mesh_unique: self._mesh_title(mesh_uuid)
+                        for mesh_unique, mesh_uuid in self._discovered_zng_meshes.items()
+                    },
+                    {
+                        service_info.address: f"{service_info.name} ({service_info.address})"
+                        for service_info in self._discovered_ble_devices.values()
+                    },
+                ],
+            )
+        )
+        options[self._manual_net_option] = "Add BanlanX Network Device (Manual Host/IP)"
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_ADDRESS): vol.In(
-                        dict(
-                            functools.reduce(
-                                operator.or_,
-                                [
-                                    {
-                                        mesh_unique: self._mesh_title(mesh_uuid)
-                                        for mesh_unique, mesh_uuid in self._discovered_zng_meshes.items()
-                                    },
-                                    {
-                                        service_info.address: f"{service_info.name} ({service_info.address})"
-                                        for service_info in self._discovered_ble_devices.values()
-                                    },
-                                ],
-                            )
+                    vol.Required(CONF_ADDRESS): vol.In(options),
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_net_manual(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Manually configure a network device."""
+        errors: dict[str, str] = {}
+        from .lib.net.models import UNILED_NET_MODELS
+
+        net_model_names = [model.model_name for model in UNILED_NET_MODELS]
+        default_model = net_model_names[0] if net_model_names else "SP541E"
+        default_port = 8587
+
+        if user_input is not None:
+            host = user_input.get(CONF_HOST) or user_input.get(CONF_IP_ADDRESS)
+            port = int(user_input.get(CONF_PORT, default_port))
+            model_name = user_input.get(CONF_MODEL, default_model)
+
+            try:
+                temp = UniledNetDevice({}, host, port, model_name)
+                if not await temp.update(retry=0):
+                    errors["base"] = "cannot_connect"
+                await temp.stop()
+            except Exception:
+                errors["base"] = "cannot_connect"
+
+            if not errors:
+                unique = f"{host}:{port}"
+                await self.async_set_unique_id(unique)
+                self._abort_if_unique_id_configured()
+
+                self.context[CONF_TRANSPORT] = UNILED_TRANSPORT_NET
+                self.context[CONF_HOST] = host
+                self.context[CONF_PORT] = port
+                self.context[CONF_MODEL] = model_name
+                self.context[CONF_ADDRESS] = host
+                self.context["title_placeholders"] = {
+                    "name": f"{model_name} ({host})",
+                }
+                return self.async_create_entry(
+                    title=self.context["title_placeholders"]["name"],
+                    data={
+                        CONF_TRANSPORT: UNILED_TRANSPORT_NET,
+                        CONF_HOST: host,
+                        CONF_PORT: port,
+                        CONF_ADDRESS: host,
+                        CONF_MODEL: model_name,
+                    },
+                    options={
+                        CONF_RETRY_COUNT: DEFAULT_RETRY_COUNT,
+                        CONF_UPDATE_INTERVAL: DEFAULT_UPDATE_INTERVAL,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="net_manual",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_HOST, default=user_input.get(CONF_HOST) if user_input else ""): str,
+                    vol.Required(CONF_PORT, default=user_input.get(CONF_PORT) if user_input else default_port): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(min=1, max=65535),
+                    ),
+                    vol.Required(CONF_MODEL, default=user_input.get(CONF_MODEL) if user_input else default_model): SelectSelector(
+                        SelectSelectorConfig(
+                            mode=SelectSelectorMode.DROPDOWN,
+                            options=net_model_names,
                         )
                     ),
                 }
